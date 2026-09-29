@@ -1,4 +1,5 @@
 import "dotenv/config";
+import dns from "node:dns";
 import { PrismaClient } from "../generated/prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 import {
@@ -7,10 +8,139 @@ import {
 } from "../generated/prisma/client";
 import crypto from "crypto";
 import { recalculateKPI, getPeriodBounds } from "../src/modules/kpi/service";
+import { computeKPIs } from "../src/modules/kpi/engine";
+import type { HistoricalShipmentRecord } from "../src/modules/kpi/types";
 import { haversineKm } from "../src/shared/utils";
 
-const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! });
-const prisma = new PrismaClient({ adapter });
+let prisma: PrismaClient;
+
+/**
+ * Resolves the Neon hostname to its IPv4 address before connecting — this
+ * network can't route to the IPv6 address Node otherwise selects for it,
+ * which caused persistent ETIMEDOUTs even with
+ * dns.setDefaultResultOrder("ipv4first") set: pg's own connection code
+ * (lib/connection.js) calls net.Socket.connect(port, host) with the plain
+ * hostname, a path that doesn't honor that ordering hint. The address is
+ * looked up fresh each run (never hardcoded); the original hostname is kept
+ * for TLS SNI/cert validation via `servername`. A single, kept-alive
+ * connection is used instead of pg.Pool's defaults (max 10, no keepAlive,
+ * 10s idle timeout) — this script is a long-running sequential batch job,
+ * not a request-scoped workload, and Neon silently drops idle connections
+ * that go unprobed, surfacing as "Connection terminated unexpectedly" the
+ * next time the pool tries to reuse one.
+ */
+async function initPrisma() {
+  const parsedUrl = new URL(process.env.DATABASE_URL!);
+  const neonHostname = parsedUrl.hostname;
+  const { address: ipv4Address } = await dns.promises.lookup(neonHostname, { family: 4 });
+
+  const adapter = new PrismaPg({
+    host: ipv4Address,
+    port: parsedUrl.port ? Number(parsedUrl.port) : 5432,
+    database: parsedUrl.pathname.replace(/^\//, ""),
+    user: decodeURIComponent(parsedUrl.username),
+    password: decodeURIComponent(parsedUrl.password),
+    max: 1,
+    keepAlive: true,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 10_000,
+    ssl: { rejectUnauthorized: false, servername: neonHostname },
+  });
+  prisma = new PrismaClient({ adapter });
+}
+
+/**
+ * Reconstructs HistoricalShipmentRecord[] for an already-seeded (transporter,
+ * period) using several flat, single-table queries instead of kpi/service.ts's
+ * getHistoricalShipments() one deep multi-relation `include` — the large join
+ * (especially the 1:many locations join) is what timed out against Neon.
+ * Mapping logic mirrors kpi/service.ts's toHistoricalRecord() exactly.
+ */
+async function getHistoricalRecordsForSeed(transporterId: string, period: string): Promise<HistoricalShipmentRecord[]> {
+  const { start, end } = getPeriodBounds(period);
+  const shipments = await prisma.shipment.findMany({
+    where: {
+      transporterId,
+      status: { in: [ShipmentStatus.DELIVERED, ShipmentStatus.COMPLETED] },
+      deliveredAt: { gte: start, lt: end },
+    },
+    select: { id: true, status: true, dispatchedAt: true, deliveredAt: true, slaDeadline: true },
+  });
+  const shipmentIds = shipments.map((s) => s.id);
+  if (shipmentIds.length === 0) return [];
+
+  // Awaited one at a time rather than via Promise.all — each is individually
+  // tiny (at most one row per shipment), but firing them concurrently competes
+  // for connections against Neon's pooled tier, which is what caused the
+  // ETIMEDOUT to land on whichever of the three lost that race on a given run.
+  const slas = await prisma.sLA.findMany({ where: { shipmentId: { in: shipmentIds } }, select: { shipmentId: true, isBreached: true } });
+  const pods = await prisma.pOD.findMany({ where: { shipmentId: { in: shipmentIds } }, select: { shipmentId: true, status: true, condition: true } });
+  const riskEvents = await prisma.sLARiskEvent.findMany({
+    where: { shipmentId: { in: shipmentIds }, riskLevel: { in: [SLARiskLevel.HIGH, SLARiskLevel.CRITICAL] } },
+    select: { shipmentId: true },
+  });
+
+  // Fetched sequentially in small shipment-ID batches, not via Promise.all with the
+  // queries above — this is the query that timed out against Neon (each tracked
+  // shipment can generate 60+ pings), so it's kept to small, low-risk round trips.
+  const LOCATION_BATCH_SIZE = 2;
+  const locations: { shipmentId: string; recordedAt: Date }[] = [];
+  for (let i = 0; i < shipmentIds.length; i += LOCATION_BATCH_SIZE) {
+    const batchIds = shipmentIds.slice(i, i + LOCATION_BATCH_SIZE);
+    const batch = await prisma.shipmentLocation.findMany({
+      where: { shipmentId: { in: batchIds } },
+      select: { shipmentId: true, recordedAt: true },
+    });
+    locations.push(...batch);
+  }
+
+  const slaByShipment = new Map(slas.map((s) => [s.shipmentId, s]));
+  const podByShipment = new Map(pods.map((p) => [p.shipmentId, p]));
+  const locationsByShipment = new Map<string, Date[]>();
+  for (const loc of locations) {
+    const arr = locationsByShipment.get(loc.shipmentId) ?? [];
+    arr.push(loc.recordedAt);
+    locationsByShipment.set(loc.shipmentId, arr);
+  }
+  const exceptionShipmentIds = new Set(riskEvents.map((e) => e.shipmentId));
+
+  return shipments.map((s) => ({
+    id: s.id,
+    status: s.status as "DELIVERED" | "COMPLETED",
+    dispatchedAt: s.dispatchedAt,
+    deliveredAt: s.deliveredAt,
+    slaDeadline: s.slaDeadline,
+    slaIsBreached: s.status === ShipmentStatus.COMPLETED ? (slaByShipment.get(s.id)?.isBreached ?? null) : null,
+    podStatus: podByShipment.get(s.id)?.status ?? null,
+    podCondition: podByShipment.get(s.id)?.condition ?? null,
+    locationTimestamps: locationsByShipment.get(s.id) ?? [],
+    hadHighSeverityException: exceptionShipmentIds.has(s.id),
+  }));
+}
+
+/** Shared by both the in-memory (new-quarter) and DB-reconstructed (already-seeded) KPI paths. */
+async function upsertKpiFromResult(transporterId: string, period: string, result: ReturnType<typeof computeKPIs>) {
+  if (result.totalShipments === 0) return null;
+  const kpiData = {
+    totalShipments: result.totalShipments,
+    onTimeDeliveries: result.onTimeDeliveries,
+    otifPercent: result.otifPercent,
+    avgTatHours: result.avgTatHours,
+    slaBreachRatePercent: result.slaBreachRatePercent,
+    damageShortageRatePercent: result.damageShortageRatePercent,
+    trackingCompliancePercent: result.trackingCompliancePercent,
+    podCompliancePercent: result.podCompliancePercent,
+    exceptionRatePercent: result.exceptionRatePercent,
+    compositeScore: result.compositeScore,
+    computedAt: result.calculatedAt,
+  };
+  const row = await prisma.transporterKPI.upsert({
+    where: { transporterId_period: { transporterId, period } },
+    update: kpiData,
+    create: { transporterId, period, ...kpiData },
+  });
+  return { ...row, components: result.components };
+}
 
 async function main() {
   console.log("🌱 Seeding database...");
@@ -507,6 +637,8 @@ async function main() {
         const routes = (profile.transporter.supportedRoutes as unknown as { origin: string; destination: string }[]);
         const routePairs = routes.length > 0 ? routes : [{ origin: "Pune", destination: "Hyderabad" }];
 
+        const records: HistoricalShipmentRecord[] = [];
+
         for (let i = 0; i < q.shipmentsPerQuarter; i++) {
           const routePair = pick(rng, routePairs);
           const origin = CITY_COORDS[routePair.origin] ?? CITY_COORDS.Pune;
@@ -610,9 +742,11 @@ async function main() {
           // GPS trail: dense and regular when tracking-compliant, sparse/gappy otherwise.
           const isTracked = rng() < q.trackingGoodProb;
           const pingCount = isTracked ? Math.max(8, Math.round(tatHours * 3)) : Math.floor(randRange(rng, 0, 3));
+          const pingTimestamps: Date[] = [];
           for (let p = 1; p <= pingCount; p++) {
             const fraction = isTracked ? p / (pingCount + 1) : rng();
             const at = new Date(dispatchedAt.getTime() + fraction * transitMs);
+            pingTimestamps.push(at);
             await prisma.shipmentLocation.create({
               data: {
                 shipmentId: shipment.id,
@@ -626,7 +760,8 @@ async function main() {
             });
           }
 
-          if (rng() < q.exceptionProb) {
+          const hasException = rng() < q.exceptionProb;
+          if (hasException) {
             const triggeredAt = new Date(dispatchedAt.getTime() + randRange(rng, 0.2, 0.8) * transitMs);
             await prisma.sLARiskEvent.create({
               data: {
@@ -644,11 +779,35 @@ async function main() {
               },
             });
           }
+
+          records.push({
+            id: shipment.id,
+            status: shipmentStatus,
+            dispatchedAt,
+            deliveredAt,
+            slaDeadline,
+            slaIsBreached: shipmentStatus === ShipmentStatus.COMPLETED ? !isOnTime : null,
+            podStatus,
+            podCondition,
+            locationTimestamps: pingTimestamps,
+            hadHighSeverityException: hasException,
+          });
+        }
+
+        const result = computeKPIs(records);
+        const kpiRow = await upsertKpiFromResult(profile.transporter.id, period, result);
+        if (kpiRow) latestKpiByTransporter[profile.transporter.id] = kpiRow;
+      } else {
+        const existingKpi = await prisma.transporterKPI.findFirst({
+          where: { transporterId: profile.transporter.id, period },
+        });
+        if (!existingKpi) {
+          const records = await getHistoricalRecordsForSeed(profile.transporter.id, period);
+          const result = computeKPIs(records);
+          const kpiRow = await upsertKpiFromResult(profile.transporter.id, period, result);
+          if (kpiRow) latestKpiByTransporter[profile.transporter.id] = kpiRow;
         }
       }
-
-      const kpiRow = await recalculateKPI(profile.transporter.id, period);
-      if (kpiRow) latestKpiByTransporter[profile.transporter.id] = kpiRow;
     }
     console.log(`✓ Historical shipments + KPIs computed for ${profile.transporter.name}`);
   }
@@ -1045,10 +1204,11 @@ async function main() {
   console.log("   Requirement:  REQ-2026-0001 — CWH Ambala → Apollo Pharmacy Distribution Hub (Hyderabad), 2500kg cold chain");
 }
 
-main()
+initPrisma()
+  .then(main)
   .then(() => prisma.$disconnect())
   .catch(async (e) => {
     console.error("Seed failed:", e);
-    await prisma.$disconnect();
+    await prisma?.$disconnect();
     process.exit(1);
   });
