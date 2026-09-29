@@ -1,0 +1,711 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────
+
+enum UserRole {
+  ADMIN
+  MANAGER
+  VIEWER
+}
+
+// DRAFT = incomplete, not yet ready to send. READY_TO_SEND = complete but
+// not yet sent to transporters (an explicit "Send" action is required — see
+// requirements/service.ts). OPEN = sent for quotation. MATCHED = at least
+// one transporter has submitted a quote ("quotations received"). ASSIGNED =
+// a transporter has been picked ("transporter assigned").
+enum RequirementStatus {
+  DRAFT
+  READY_TO_SEND
+  OPEN
+  MATCHED
+  ASSIGNED
+  CANCELLED
+}
+
+// PENDING = quotation requested, transporter has not yet responded.
+// SUBMITTED = transporter has entered and submitted a quoted price via
+// their one-time link. ACCEPTED/REJECTED are reserved for a future
+// per-offer manager decision step (not used by the current flow, where the
+// manager instead picks one submitted offer and assigns it directly).
+enum OfferStatus {
+  PENDING
+  SUBMITTED
+  ACCEPTED
+  REJECTED
+  WITHDRAWN
+}
+
+enum ShipmentStatus {
+  CREATED
+  DISPATCHED
+  IN_TRANSIT
+  DELAYED
+  AT_RISK
+  DELIVERED
+  COMPLETED
+  CANCELLED
+}
+
+enum SLARiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+// Predictive SLA status — the primary output of the SLA risk engine.
+// Distinct from SLARiskLevel (kept for backward-compat severity color-coding).
+enum SLAStatus {
+  ON_TRACK
+  AT_RISK
+  HIGH_RISK
+  BREACH
+  DELIVERED
+}
+
+enum RiskConfidence {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum RouteEventType {
+  TRAFFIC
+  ROAD_CLOSURE
+  ACCIDENT
+  FESTIVAL
+  PUBLIC_EVENT
+  LOCAL_FUNCTION
+  CONSTRUCTION
+  WEATHER
+  STRIKE
+  OTHER
+}
+
+enum RouteEventSource {
+  MOCK
+  EXTERNAL_API
+}
+
+enum PODStatus {
+  PENDING
+  SUBMITTED
+  APPROVED
+  REJECTED
+}
+
+enum PODCondition {
+  GOOD
+  DAMAGED
+  PARTIAL
+}
+
+// How the receiver's identity/acceptance was verified. OTP/SIGNATURE/
+// OTP_AND_SIGNATURE are retained for historical/seeded POD records only —
+// the current digital POD workflow uses QR_CONFIRMATION exclusively (the
+// receiver scans a shipment-specific QR code and confirms delivery).
+enum PODVerificationMethod {
+  OTP
+  SIGNATURE
+  OTP_AND_SIGNATURE
+  QR_CONFIRMATION
+}
+
+enum LocationSource {
+  SIMULATED
+  TRACCAR
+  AIS140
+  TRANSPORTER_API
+}
+
+// CWH = the fixed set of company-operated warehouse sources a shipment can
+// originate from. DESTINATION = an exact receiving facility (e.g. a
+// pharmacy distribution hub) a shipment can be delivered to.
+enum FacilityType {
+  CWH
+  DESTINATION
+}
+
+enum VehicleType {
+  TRUCK_SMALL // up to 1 tonne
+  TRUCK_MEDIUM // 1–5 tonnes
+  TRUCK_LARGE // 5–15 tonnes
+  CONTAINER_20FT
+  CONTAINER_40FT
+  REEFER_SMALL // cold chain, small
+  REEFER_LARGE // cold chain, large
+}
+
+// ─────────────────────────────────────────────
+// COMPANY
+// ─────────────────────────────────────────────
+
+model Company {
+  id           String   @id @default(cuid())
+  name         String
+  gstin        String?  @unique
+  address      String?
+  city         String?
+  state        String?
+  pincode      String?
+  contactName  String?
+  contactPhone String?
+  contactEmail String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  users        User[]
+  requirements TransportRequirement[]
+
+  @@map("companies")
+}
+
+// ─────────────────────────────────────────────
+// FACILITY — CWH sources and exact destination facilities.
+//
+// A single model reused for both ends of a shipment: CWH-type rows are
+// the fixed set of company warehouse sources; DESTINATION-type rows are
+// exact receiving facilities (with the receiving organisation and address
+// already known) that a shipment can be delivered to. Selecting a
+// facility at requirement-creation time is what lets the POD workflow
+// auto-fill receiver organisation/facility/address later.
+// ─────────────────────────────────────────────
+
+model Facility {
+  id               String       @id @default(cuid())
+  type             FacilityType
+  name             String
+  // Receiving organisation name, e.g. "Apollo Pharmacy" for a
+  // "Apollo Pharmacy Distribution Hub" facility. Null for CWH sources.
+  organizationName String?
+  address          String?
+  city             String
+  state            String
+  lat              Decimal      @db.Decimal(10, 7)
+  lng              Decimal      @db.Decimal(10, 7)
+  isActive         Boolean      @default(true)
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  originRequirements      TransportRequirement[] @relation("RequirementOrigin")
+  destinationRequirements TransportRequirement[] @relation("RequirementDestination")
+  originShipments         Shipment[]             @relation("ShipmentOrigin")
+  destinationShipments    Shipment[]             @relation("ShipmentDestination")
+
+  @@index([type])
+  @@map("facilities")
+}
+
+// ─────────────────────────────────────────────
+// USER / MANAGER
+// ─────────────────────────────────────────────
+
+model User {
+  id        String   @id @default(cuid())
+  companyId String
+  name      String
+  email     String   @unique
+  phone     String?
+  role      UserRole @default(MANAGER)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id])
+
+  requirements TransportRequirement[]
+  podReviews   POD[]                  @relation("PODReviewer")
+
+  @@index([companyId])
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────
+// TRANSPORTER
+// ─────────────────────────────────────────────
+
+model Transporter {
+  id               String        @id @default(cuid())
+  name             String
+  gstin            String?       @unique
+  contactName      String
+  contactPhone     String
+  contactEmail     String?
+  address          String?
+  city             String?
+  state            String?
+  coldChainCapable Boolean       @default(false)
+  // Supported origin→destination pairs stored as JSON array of {origin, destination}
+  supportedRoutes  Json          @default("[]")
+  // Vehicle types this transporter operates
+  vehicleTypes     VehicleType[]
+  baseCostPerKmInr Decimal       @db.Decimal(10, 2)
+  isActive         Boolean       @default(true)
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  vehicles  Vehicle[]
+  offers    TransporterOffer[]
+  shipments Shipment[]
+  kpis      TransporterKPI[]
+
+  @@map("transporters")
+}
+
+// ─────────────────────────────────────────────
+// VEHICLE
+// ─────────────────────────────────────────────
+
+model Vehicle {
+  id             String      @id @default(cuid())
+  transporterId  String
+  vehicleNumber  String      @unique // e.g. MH12AB1234
+  vehicleType    VehicleType
+  capacityKg     Int
+  coldChain      Boolean     @default(false)
+  tempMinCelsius Decimal?    @db.Decimal(5, 2)
+  tempMaxCelsius Decimal?    @db.Decimal(5, 2)
+  driverName     String?
+  driverPhone    String?
+  isActive       Boolean     @default(true)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  transporter Transporter        @relation(fields: [transporterId], references: [id])
+  shipments   Shipment[]
+  locations   ShipmentLocation[]
+
+  @@index([transporterId])
+  @@map("vehicles")
+}
+
+// ─────────────────────────────────────────────
+// TRANSPORT REQUIREMENT
+// ─────────────────────────────────────────────
+
+model TransportRequirement {
+  id                      String            @id @default(cuid())
+  companyId               String
+  createdById             String
+  referenceNumber         String            @unique // e.g. REQ-2026-0001
+  // Nullable: only rows created through the facility-based flow have
+  // these set. Historical/seeded requirements predate this model and
+  // carry only the denormalized city/state/lat/lng fields below.
+  originFacilityId        String?
+  destinationFacilityId   String?
+  // Nullable so an incomplete Draft can be saved before a route is picked.
+  // Required in practice once the requirement leaves DRAFT — enforced in
+  // requirements/service.ts, not at the schema level.
+  originCity              String?
+  originState             String?
+  originLat               Decimal?          @db.Decimal(10, 7)
+  originLng               Decimal?          @db.Decimal(10, 7)
+  destinationCity         String?
+  destinationState        String?
+  destinationLat          Decimal?          @db.Decimal(10, 7)
+  destinationLng          Decimal?          @db.Decimal(10, 7)
+  productType             String? // e.g. "Pharmaceutical Products"
+  productDescription      String?
+  weightKg                Decimal?          @db.Decimal(10, 2)
+  volumeCbm               Decimal?          @db.Decimal(8, 3)
+  coldChainRequired       Boolean           @default(false)
+  tempMinCelsius          Decimal?          @db.Decimal(5, 2)
+  tempMaxCelsius          Decimal?          @db.Decimal(5, 2)
+  maxCostInr              Decimal?          @db.Decimal(12, 2)
+  slaDeadline             DateTime?
+  specialInstructions     String?
+  status                  RequirementStatus @default(DRAFT)
+  // How many transporters this requirement was actually sent a quotation
+  // request to (== offers created at send time). Paired with the live
+  // `offers` count of submitted quotes to show "Responses: {submitted}/
+  // {this}" — see requirements/service.ts sendForQuotation(). Null until
+  // the requirement has been sent.
+  matchedTransporterCount Int?
+  // Deadline for transporters to submit a quotation, set once at send time
+  // (sendForQuotation). Enforced on the public quote-submission endpoint —
+  // see modules/quotation/rules.ts.
+  quotationDeadline       DateTime?
+  createdAt               DateTime          @default(now())
+  updatedAt               DateTime          @updatedAt
+
+  company             Company   @relation(fields: [companyId], references: [id])
+  createdBy           User      @relation(fields: [createdById], references: [id])
+  originFacility      Facility? @relation("RequirementOrigin", fields: [originFacilityId], references: [id])
+  destinationFacility Facility? @relation("RequirementDestination", fields: [destinationFacilityId], references: [id])
+
+  offers   TransporterOffer[]
+  shipment Shipment?
+
+  @@index([companyId])
+  @@index([status])
+  @@index([slaDeadline])
+  @@index([originFacilityId])
+  @@index([destinationFacilityId])
+  @@map("transport_requirements")
+}
+
+// ─────────────────────────────────────────────
+// TRANSPORTER OFFER / QUOTE
+// ─────────────────────────────────────────────
+
+model TransporterOffer {
+  id              String      @id @default(cuid())
+  requirementId   String
+  transporterId   String
+  vehicleId       String?
+  // Null until the transporter submits — this row represents the quotation
+  // *request* from the moment it's sent, not only a submitted quote.
+  quotedCostInr   Decimal?    @db.Decimal(12, 2)
+  estimatedTatHrs Int? // estimated transit hours — not collected by the current quotation form; reserved for future use
+  notes           String? // transporter's optional remarks, entered at submission time
+  status          OfferStatus @default(PENDING)
+  // Shipment-specific, transporter-specific one-time link credential — see
+  // modules/quotation. Generated when the offer is created (send time).
+  // Never returned by any manager-authenticated read except the send
+  // response and the requirement detail view, which is a deliberate POC
+  // simplification standing in for actually emailing the link — see
+  // modules/quotation/service.ts.
+  quoteToken      String?     @unique
+  submittedAt     DateTime?
+  // Snapshot of transporter KPI at time of offer for comparison
+  kpiSnapshot     Json?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  requirement TransportRequirement @relation(fields: [requirementId], references: [id])
+  transporter Transporter          @relation(fields: [transporterId], references: [id])
+
+  @@unique([requirementId, transporterId])
+  @@index([requirementId])
+  @@index([transporterId])
+  @@map("transporter_offers")
+}
+
+// ─────────────────────────────────────────────
+// SHIPMENT
+// ─────────────────────────────────────────────
+
+model Shipment {
+  id                    String         @id @default(cuid())
+  requirementId         String         @unique
+  transporterId         String
+  vehicleId             String
+  trackingNumber        String         @unique // e.g. SHP-2026-0001
+  // Shipment-specific token embedded in the simulated transporter
+  // assignment-notification link, generated at shipment creation — same
+  // POC-level "auth" pattern as POD.qrToken and TransporterOffer.quoteToken.
+  assignmentToken       String?        @unique
+  // Copied from the requirement's facility selection at creation time —
+  // nullable for the same reason as TransportRequirement's equivalents.
+  originFacilityId      String?
+  destinationFacilityId String?
+  originCity            String
+  originState           String
+  originLat             Decimal        @db.Decimal(10, 7)
+  originLng             Decimal        @db.Decimal(10, 7)
+  destinationCity       String
+  destinationState      String
+  destinationLat        Decimal        @db.Decimal(10, 7)
+  destinationLng        Decimal        @db.Decimal(10, 7)
+  // Route polyline stored as GeoJSON LineString coordinates array
+  routePolyline         Json?
+  distanceKm            Decimal?       @db.Decimal(8, 2)
+  agreedCostInr         Decimal        @db.Decimal(12, 2)
+  slaDeadline           DateTime
+  status                ShipmentStatus @default(CREATED)
+  dispatchedAt          DateTime?
+  deliveredAt           DateTime?
+  completedAt           DateTime?
+  cancelledAt           DateTime?
+  notes                 String?
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+
+  requirement         TransportRequirement @relation(fields: [requirementId], references: [id])
+  transporter         Transporter          @relation(fields: [transporterId], references: [id])
+  vehicle             Vehicle              @relation(fields: [vehicleId], references: [id])
+  originFacility      Facility?            @relation("ShipmentOrigin", fields: [originFacilityId], references: [id])
+  destinationFacility Facility?            @relation("ShipmentDestination", fields: [destinationFacilityId], references: [id])
+
+  locations    ShipmentLocation[]
+  etaSnapshots ETASnapshot[]
+  sla          SLA?
+  slaEvents    SLARiskEvent[]
+  routeEvents  ShipmentRouteEvent[]
+  pod          POD?
+
+  @@index([transporterId])
+  @@index([status])
+  @@index([slaDeadline])
+  @@index([originFacilityId])
+  @@index([destinationFacilityId])
+  @@map("shipments")
+}
+
+// ─────────────────────────────────────────────
+// SHIPMENT LOCATION (GPS trail)
+// ─────────────────────────────────────────────
+
+model ShipmentLocation {
+  id         String         @id @default(cuid())
+  shipmentId String
+  vehicleId  String
+  latitude   Decimal        @db.Decimal(10, 7)
+  longitude  Decimal        @db.Decimal(10, 7)
+  speedKmh   Decimal?       @db.Decimal(6, 2)
+  heading    Int? // degrees 0–359
+  source     LocationSource @default(SIMULATED)
+  recordedAt DateTime
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id])
+  vehicle  Vehicle  @relation(fields: [vehicleId], references: [id])
+
+  @@index([shipmentId, recordedAt(sort: Desc)])
+  @@index([vehicleId, recordedAt(sort: Desc)])
+  @@map("shipment_locations")
+}
+
+// ─────────────────────────────────────────────
+// ETA SNAPSHOT
+// ─────────────────────────────────────────────
+
+model ETASnapshot {
+  id                  String   @id @default(cuid())
+  shipmentId          String
+  estimatedArrival    DateTime
+  distanceRemainingKm Decimal  @db.Decimal(8, 2)
+  avgSpeedKmh         Decimal  @db.Decimal(6, 2)
+  // Total delay added from active route events
+  routeEventDelayMins Int      @default(0)
+  calculatedAt        DateTime @default(now())
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id])
+
+  @@index([shipmentId, calculatedAt(sort: Desc)])
+  @@map("eta_snapshots")
+}
+
+// ─────────────────────────────────────────────
+// SLA
+// ─────────────────────────────────────────────
+
+model SLA {
+  id                      String    @id @default(cuid())
+  shipmentId              String    @unique
+  deadline                DateTime
+  // Agreed TAT in hours from dispatch
+  agreedTatHours          Int
+  // Breach = delivered_at > deadline
+  isBreached              Boolean   @default(false)
+  breachedAt              DateTime?
+  // Minutes early (positive) or late (negative) at delivery
+  deliveryVarianceMinutes Int?
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id])
+
+  @@map("slas")
+}
+
+// ─────────────────────────────────────────────
+// SLA RISK EVENT
+// ─────────────────────────────────────────────
+
+model SLARiskEvent {
+  id                    String         @id @default(cuid())
+  shipmentId            String
+  // Predictive status from the SLA risk engine (ON_TRACK/AT_RISK/HIGH_RISK/BREACH/DELIVERED)
+  status                SLAStatus      @default(AT_RISK)
+  // Legacy severity, derived 1:1 from `status` — kept for existing color-coded UI
+  riskLevel             SLARiskLevel
+  predictedDelayMinutes Int            @default(0)
+  // Minutes remaining between now and the SLA deadline at calculation time
+  bufferMinutes         Int            @default(0)
+  confidence            RiskConfidence @default(MEDIUM)
+  confidenceReason      String?
+  // Array of { code, description, impactMinutes, severity }
+  reasons               Json
+  isActive              Boolean        @default(true)
+  triggeredAt           DateTime       @default(now())
+  resolvedAt            DateTime?
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id])
+
+  @@index([shipmentId, isActive])
+  @@index([triggeredAt])
+  @@map("sla_risk_events")
+}
+
+// ─────────────────────────────────────────────
+// ROUTE EVENT
+// ─────────────────────────────────────────────
+
+model RouteEvent {
+  id                    String           @id @default(cuid())
+  eventType             RouteEventType
+  title                 String
+  description           String
+  affectedHighway       String? // e.g. "NH-65"
+  affectedCity          String?
+  // Bounding box: { latMin, latMax, lngMin, lngMax }
+  affectedRegion        Json
+  // Reuses the same LOW/MEDIUM/HIGH/CRITICAL vocabulary as SLA risk, so an
+  // event's severity maps directly onto the reason it contributes to a risk assessment.
+  severity              SLARiskLevel     @default(MEDIUM)
+  estimatedDelayMinutes Int
+  source                RouteEventSource @default(MOCK)
+  validFrom             DateTime
+  validUntil            DateTime
+  createdAt             DateTime         @default(now())
+
+  shipmentLinks ShipmentRouteEvent[]
+
+  @@index([validFrom, validUntil])
+  @@index([eventType])
+  @@map("route_events")
+}
+
+// ─────────────────────────────────────────────
+// SHIPMENT ↔ ROUTE EVENT (join table)
+// ─────────────────────────────────────────────
+
+model ShipmentRouteEvent {
+  id           String   @id @default(cuid())
+  shipmentId   String
+  routeEventId String
+  detectedAt   DateTime @default(now())
+
+  shipment   Shipment   @relation(fields: [shipmentId], references: [id])
+  routeEvent RouteEvent @relation(fields: [routeEventId], references: [id])
+
+  @@unique([shipmentId, routeEventId])
+  @@index([shipmentId])
+  @@map("shipment_route_events")
+}
+
+// ─────────────────────────────────────────────
+// POD — PROOF OF DELIVERY
+// ─────────────────────────────────────────────
+
+model POD {
+  id                   String                 @id @default(cuid())
+  shipmentId           String                 @unique
+  // Shipment-specific token embedded in the delivery QR code. Generated
+  // when the shipment (and its PENDING POD row) is created. The receiver
+  // confirmation page and its confirm endpoint are looked up by this
+  // token — POC-level "auth", not a production credential.
+  qrToken              String?                @unique
+  receiverName         String?
+  receiverDesignation  String?
+  receiverOrganization String?
+  receiverPhone        String?
+  deliveredQuantityKg  Decimal?               @db.Decimal(10, 2)
+  condition            PODCondition?
+  // Delivery Inspection & Acceptance — structured answers the receiver
+  // gives before submitting the POD. Each is nullable because it's only
+  // populated once the receiver actually submits (and temperatureExcursion
+  // stays null for non-cold-chain shipments, where it's never asked).
+  packagingDamaged     Boolean?
+  productIssueObserved Boolean?
+  temperatureExcursion Boolean?
+  // Derived from the inspection answers at submission time — true if any
+  // of packaging/product/temperature/quantity indicated a problem. Lets the
+  // manager spot flagged deliveries without re-deriving it from the raw
+  // fields. An exception is recorded, not auto-failed — the POD still
+  // reaches SUBMITTED and goes through the normal review flow.
+  hasException         Boolean                @default(false)
+  // GPS location captured on the driver's device at the time of delivery
+  deliveryLat          Decimal?               @db.Decimal(10, 7)
+  deliveryLng          Decimal?               @db.Decimal(10, 7)
+  verificationMethod   PODVerificationMethod?
+  // Hashed OTP — never store plain text. Simulated for this POC — no real SMS is sent.
+  otpHash              String?
+  otpVerifiedAt        DateTime?
+  // Base64 PNG from the canvas signature pad. Captured for workflow
+  // demonstration only — not a legally binding electronic signature.
+  signatureData        String?
+  // Array of storage keys or base64 strings
+  photoUrls            Json                   @default("[]")
+  notes                String?
+  status               PODStatus              @default(PENDING)
+  submittedAt          DateTime?
+  reviewedById         String?
+  reviewedAt           DateTime?
+  rejectionReason      String?
+  createdAt            DateTime               @default(now())
+  updatedAt            DateTime               @updatedAt
+
+  shipment   Shipment @relation(fields: [shipmentId], references: [id])
+  reviewedBy User?    @relation("PODReviewer", fields: [reviewedById], references: [id])
+
+  @@index([status])
+  @@map("pods")
+}
+
+// ─────────────────────────────────────────────
+// TRANSPORTER KPI
+// ─────────────────────────────────────────────
+
+model TransporterKPI {
+  id                        String   @id @default(cuid())
+  transporterId             String
+  // e.g. "2026-Q2", "2026-09"
+  period                    String
+  // Size of the settled-shipment cohort (DELIVERED + COMPLETED) this snapshot was computed from.
+  totalShipments            Int      @default(0)
+  onTimeDeliveries          Int      @default(0)
+  // Each KPI below is nullable — null means "not enough shipment data to
+  // compute this KPI for the period", not zero. Never inferred/invented;
+  // see src/modules/kpi/engine.ts for exactly what makes a shipment
+  // eligible for each metric.
+  // OTIF = On Time In Full %
+  otifPercent               Decimal? @db.Decimal(5, 2)
+  avgTatHours               Decimal? @db.Decimal(6, 2)
+  slaBreachRatePercent      Decimal? @db.Decimal(5, 2)
+  damageShortageRatePercent Decimal? @db.Decimal(5, 2)
+  trackingCompliancePercent Decimal? @db.Decimal(5, 2)
+  podCompliancePercent      Decimal? @db.Decimal(5, 2)
+  exceptionRatePercent      Decimal? @db.Decimal(5, 2)
+  // Composite score 0–100 used for ranking in matching. Null only when
+  // every component KPI above is unavailable.
+  compositeScore            Decimal? @db.Decimal(5, 2)
+  computedAt                DateTime @default(now())
+
+  transporter Transporter @relation(fields: [transporterId], references: [id])
+
+  @@unique([transporterId, period])
+  @@index([transporterId])
+  @@map("transporter_kpis")
+}
+
+// ─────────────────────────────────────────────
+// DEMO SESSION — demo mode only, not core business data.
+//
+// Tracks which requirement/shipment the presenter is currently driving
+// through the Demo Control Panel. Deliberately has no foreign-key
+// relations to Requirement/Shipment (plain string ids) so demo resets can
+// freely delete/recreate those rows without touching this table's
+// constraints, and so this table can never appear in normal
+// business-object queries (Shipment/TransportRequirement have no back
+// reference to it). Treated as a singleton — one active demo at a time.
+// ─────────────────────────────────────────────
+
+model DemoSession {
+  id            String   @id @default(cuid())
+  requirementId String?
+  shipmentId    String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@map("demo_sessions")
+}
